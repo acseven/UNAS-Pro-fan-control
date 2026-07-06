@@ -257,6 +257,12 @@ set_fan_speed() {
 
         fan_speed=$(awk -v tgt="$tgt" -v actual="$actual" -v max="$max" -v floor="$MIN_FAN" '
         BEGIN {
+            # Clamp the floor into the valid PWM range first. An absurdly
+            # large floor (bad MIN_FAN edit) otherwise cancels catastrophically
+            # in floor + ratio * (255 - floor) and prints 0 -- commanding the
+            # fans OFF precisely when overheating.
+            if (floor < 0) floor = 0
+            if (floor > 255) floor = 255
             if (max <= tgt) {
                 # Degenerate/inverted parameters (TGT >= MAX): fail hot.
                 # Without this, actual <= tgt would swallow the whole range
