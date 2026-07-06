@@ -35,6 +35,22 @@ SSD_TGT=50
 SSD_MAX=70
 MIN_FAN=39  # 15% of 255 (increase baseline to reduce fan speed variation)
 
+# Optional overrides for the parameters above, written by the MQTT bridge when
+# tuning from Home Assistant (see mqtt_bridge.py). Sourced on every loop
+# iteration so changes apply within a minute. Delete the file to return to the
+# defaults above.
+FAN_CONF=/root/fan_control.conf
+
+# Optional state-snapshot helper (fan_control_state.sh) used by the MQTT
+# bridge; without it these hooks are no-ops and nothing changes.
+if [[ -f /root/fan_control_state.sh ]]; then
+    source /root/fan_control_state.sh
+else
+    state_begin() { :; }
+    state_add_drive() { :; }
+    state_end() { :; }
+fi
+
 usage() {
     cat <<'EOF'
 Usage: fan_control.sh [--service | --restore | -h | --help]
@@ -154,7 +170,7 @@ get_disk_temps() {
 
             ([current_from_top, current_from_nvme_fallback, current_from_ata_attr_fallback] | first(.[]?)) as $temp
             | select($temp != null)
-            | [(device_class), $dev, ($temp | tostring)] | @tsv
+            | [(device_class), $dev, ($temp | tostring), (.serial_number // "")] | @tsv
         ' <<< "$json" 2>/dev/null || true
     done < <(jq -r '.devices[]? | [.name, (.type // "")] | @tsv' <<< "$scan" 2>/dev/null)
 }
@@ -201,6 +217,11 @@ get_system_temps() {
 }
 
 set_fan_speed() {
+    # Apply Home Assistant/MQTT parameter overrides, and reset the state
+    # snapshot for this iteration (no-ops unless the MQTT bridge is set up).
+    [[ -f "$FAN_CONF" ]] && source "$FAN_CONF"
+    state_begin
+
     # Auto-discover all system temperature sensors (CPU die + board/airflow) and
     # track the hottest. See get_system_temps().
     SYS_TEMP=0
@@ -216,9 +237,10 @@ set_fan_speed() {
 
     # Auto-discover all SMART devices and read each one's temperature, tracking
     # the hottest HDD and the hottest SSD separately. See get_disk_temps().
-    while IFS=$'\t' read -r class dev temp; do
+    while IFS=$'\t' read -r class dev temp serial; do
         [[ "$temp" =~ ^-?[0-9]+$ ]] || continue
         log_echo "${dev} ${class} Temperature: ${temp}°C"
+        state_add_drive "$class" "$dev" "$temp" "$serial"
         if [[ "$class" == "SSD" ]]; then
             if [ "$temp" -gt "$SSD_TEMP" ]; then SSD_TEMP=$temp; fi
         else
@@ -333,6 +355,9 @@ set_fan_speed() {
         echo "No fan controller found (hwmon chip with pwm* outputs and fan*_input tachometers)."
         exit 1
     fi
+
+    # Write the state snapshot for the MQTT bridge (no-op unless installed).
+    state_end
 }
 
 # Hand the fans back to automatic (firmware/chip) control on every fan-controller

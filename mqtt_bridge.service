@@ -1,0 +1,25 @@
+# MQTT bridge for the UNAS fan control service.
+#
+# Publishes temperatures/fan speeds to MQTT with Home Assistant discovery, and
+# accepts fan-curve tuning from Home Assistant. Entirely optional: without
+# /root/mqtt_bridge.conf this unit stays inactive (ConditionPathExists), so
+# installing it has no effect for non-MQTT users. Fan control itself never
+# depends on this unit.
+#
+# Repo: https://github.com/hoxxep/UNAS-Pro-fan-control
+# License: MIT
+
+[Unit]
+Description=MQTT bridge for fan_control (Home Assistant discovery)
+ConditionPathExists=/root/mqtt_bridge.conf
+After=network-online.target fan_control.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /root/mqtt_bridge.py
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
