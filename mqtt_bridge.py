@@ -46,6 +46,13 @@ STATE_FILE = os.environ.get("FAN_STATE_FILE", "/run/fan_control/state.json")
 KEEPALIVE = 60
 STATE_EXPIRE_AFTER = 180  # seconds; ~3x the 60s fan_control loop
 MAX_PACKET = 1 << 20  # sanity cap on inbound packets; guards memory spikes
+CONF_WRITE_INTERVAL = 2.0  # min seconds between conf writes (flood/flash-wear guard)
+
+# Hard ceilings for values (re)written to fan_control.conf, matching the
+# allowlist ranges fan_control_state.sh enforces on read. Values a hand-edit
+# or bug put outside these are dropped rather than perpetuated.
+CONF_KEY_MAX = {"SYS_TGT": 150, "SYS_MAX": 150, "HDD_TGT": 150, "HDD_MAX": 150,
+                "SSD_TGT": 150, "SSD_MAX": 150, "MIN_FAN": 255}
 
 # Curve parameters exposed as Home Assistant number entities. Ranges are hard
 # caps chosen to sit below the fixed *_MAX ceilings in fan_control.sh, so a
@@ -266,6 +273,14 @@ def sanitize_id(s):
 
 
 def load_bridge_conf(path):
+    # The conf holds the broker password: enforce root-only permissions
+    # rather than trusting the documented manual chmod to have happened.
+    try:
+        if os.stat(path).st_mode & 0o077:
+            os.chmod(path, 0o600)
+            log("Tightened %s permissions to 600 (it holds MQTT_PASS)" % path)
+    except OSError:
+        pass
     raw = parse_conf_file(path)
     if "MQTT_HOST" not in raw:
         sys.exit("MQTT_HOST missing from %s" % path)
@@ -436,6 +451,7 @@ class Bridge:
         self.client = None
         self.online = False
         self.backoff = 5
+        self.last_conf_write = float("-inf")
 
     def run(self):
         while True:
@@ -529,7 +545,7 @@ class Bridge:
     def handle_command(self, pkey, payload):
         spec = PARAMS.get(pkey)
         if not spec:
-            log("Unknown parameter command: %s" % pkey)
+            log("Unknown parameter command: %r" % pkey)  # repr: no log injection
             return
         try:
             value = float(payload)
@@ -549,15 +565,21 @@ class Bridge:
             current = parse_conf_file(FAN_CONF) if os.path.exists(FAN_CONF) else {}
         except OSError:
             current = {}
-        merged = {k: int(v) for k, v in current.items() if v.isdigit()}
+        merged = {k: int(v) for k, v in current.items()
+                  if k in CONF_KEY_MAX and v.isdigit() and int(v) <= CONF_KEY_MAX[k]}
         if merged.get(spec["conf_key"]) == conf_value:
             return  # unchanged (e.g. slider drag noise) -- skip the write
+        now = time.monotonic()
+        if now - self.last_conf_write < CONF_WRITE_INTERVAL:
+            log("Ignoring %s command: conf writes rate-limited" % pkey)
+            return
         merged[spec["conf_key"]] = conf_value
         try:
             write_fan_conf(merged)
         except OSError as e:
             log("Failed to write %s: %s" % (FAN_CONF, e))
             return
+        self.last_conf_write = now
         log("Set %s=%s (conf updated; fan_control picks it up within 60s)" % (pkey, value))
         # Optimistically patch the cached state so the HA slider doesn't snap
         # back while waiting for the next fan_control loop iteration.

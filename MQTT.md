@@ -58,6 +58,31 @@ Running more than one UNAS against the same broker? Set a distinct
 with the same id will fight over one MQTT session and overwrite each other's
 entities in Home Assistant.
 
+### Broker security recommendations
+
+- **Restrict the command topics with an ACL.** Any client with publish rights
+  to `unas_fan_control/<id>/set/#` can retune the fan curve (within its safe
+  ranges — the `*_MAX` ceilings cannot be touched over MQTT, so it cannot
+  cause thermal runaway, but it can reduce cooling headroom). With mosquitto:
+
+  ```
+  # /etc/mosquitto/acl
+  user unas
+  topic write unas_fan_control/#
+  topic read homeassistant/status
+
+  user homeassistant
+  topic readwrite unas_fan_control/#
+  topic readwrite homeassistant/#
+  ```
+
+- **Credentials are sent unencrypted unless `MQTT_TLS=true`.** Fine on a
+  trusted LAN segment; enable TLS if the broker is reachable from guest/IoT
+  VLANs or anything you don't fully trust.
+- The state topic includes drive serial numbers; scope broker read access
+  accordingly, and run the uninstall's `--clear` step to remove retained
+  messages from the broker when decommissioning.
+
 ## Implementation notes
 
 The bridge is a single-file, stdlib-only python3 daemon (`mqtt_bridge.py`)

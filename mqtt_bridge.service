@@ -26,7 +26,27 @@ User=root
 MemoryMax=48M
 CPUQuota=25%
 Nice=10
+# Sandbox: this is the only network-facing process in the repo, parsing a
+# binary protocol from the broker, so confine it. It only needs to read
+# /root/mqtt_bridge.conf + /run/fan_control/state.json, write
+# /root/fan_control.conf, and open one outbound TCP connection.
+# If the bridge fails to start/connect after a UniFi OS update, bisect by
+# commenting these out (fan control itself is unaffected either way).
 NoNewPrivileges=yes
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/root
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target

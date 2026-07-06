@@ -29,14 +29,22 @@ STATE_DIR=/run/fan_control
 STATE_FILE="$STATE_DIR/state.json"
 
 # Apply fan-curve overrides from FAN_CONF. Only whitelisted keys with plain
-# non-negative integer values are accepted; anything else is ignored.
+# integer values in a sane range are accepted; anything else is ignored.
+# Range checks matter for safety, not just hygiene: an absurdly large MIN_FAN
+# reaching the awk fan curve causes float cancellation that computes a fan
+# speed of 0 while overheating. Oversized files are skipped outright.
 apply_fan_conf() {
-    local k v
+    local k v size
     [[ -f "$FAN_CONF" ]] || return 0
+    size=$(wc -c < "$FAN_CONF" 2>/dev/null) || return 0
+    [[ "$size" =~ ^[[:space:]]*[0-9]+$ && $size -le 4096 ]] || return 0
     while IFS='=' read -r k v; do
+        v="${v%$'\r'}"  # tolerate CRLF-edited files
         case "$k" in
-            SYS_TGT|SYS_MAX|HDD_TGT|HDD_MAX|SSD_TGT|SSD_MAX|MIN_FAN)
-                [[ "$v" =~ ^[0-9]+$ ]] && printf -v "$k" '%s' "$v" ;;
+            SYS_TGT|SYS_MAX|HDD_TGT|HDD_MAX|SSD_TGT|SSD_MAX)
+                [[ "$v" =~ ^[0-9]{1,3}$ && $v -le 150 ]] && printf -v "$k" '%s' "$v" ;;
+            MIN_FAN)
+                [[ "$v" =~ ^[0-9]{1,3}$ && $v -le 255 ]] && printf -v "$k" '%s' "$v" ;;
         esac
     done < "$FAN_CONF" 2>/dev/null || true
     return 0
@@ -63,6 +71,7 @@ state_end() {
         set +e
         umask 077  # snapshot holds drive serials; keep it root-only
         mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+        chmod 700 "$STATE_DIR" 2>/dev/null  # mkdir -p won't tighten a pre-existing dir
 
         # Collect tachometers from the same fan-controller chips
         # fan_control.sh drives (skip drive and PSU/PMBus chips). Keys are
