@@ -292,6 +292,21 @@ def load_bridge_conf(path):
         sys.exit("MQTT_PASS is set but MQTT_USER is missing in %s -- MQTT "
                  "cannot send a password without a username." % path)
     device_id = sanitize_id(raw.get("MQTT_DEVICE_ID") or socket.gethostname().split(".")[0].lower())
+    # "Visit" link on the HA device page. Default to the LAN IP facing the
+    # broker (hostnames often don't resolve from the HA client's browser);
+    # a UDP connect() picks the outbound interface without sending packets.
+    # HA rejects a discovery payload whose configuration_url has no scheme,
+    # so force one rather than fail silently.
+    device_url = raw.get("MQTT_DEVICE_URL")
+    if not device_url:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect((raw["MQTT_HOST"], port))
+                device_url = "https://" + s.getsockname()[0]
+        except OSError:
+            device_url = "https://" + socket.gethostname()
+    if not re.match(r"^https?://", device_url):
+        device_url = "https://" + device_url
     prefix = raw.get("MQTT_DISCOVERY_PREFIX", "homeassistant")
     if not 0 < len(device_id) <= 64 or not 0 < len(prefix) <= 64:
         sys.exit("MQTT_DEVICE_ID / MQTT_DISCOVERY_PREFIX must be 1-64 characters.")
@@ -303,6 +318,7 @@ def load_bridge_conf(path):
         "tls": raw.get("MQTT_TLS", "").lower() in ("1", "true", "yes"),
         "tls_ca": raw.get("MQTT_TLS_CA", ""),
         "device_id": device_id,
+        "device_url": device_url,
         # 23 bytes (broker-safe): 7-char prefix + 8-char hash of the full
         # device_id (so long ids that share a prefix cannot collide) + 7 chars
         # of the id for readability.
@@ -363,6 +379,9 @@ def discovery_payload(conf, state):
             "unit_of_measurement": unit,
             "state_class": "measurement",
             "expire_after": STATE_EXPIRE_AFTER,
+            # Without this HA renders long-term-statistics float noise
+            # (36.999999...) on chart axes; one decimal keeps the 37,1 style.
+            "suggested_display_precision": 1,
         }
         if device_class:
             c["device_class"] = device_class
@@ -418,6 +437,13 @@ def discovery_payload(conf, state):
             "name": "UNAS Fan Control",
             "mf": "Ubiquiti",
             "sw": VERSION,
+            # ponytail: model/hw fields double as user-facing notes; HA has no
+            # free-text entity in MQTT discovery, and only one clickable link
+            # (configuration_url, used for the host). model_id would render
+            # inline as "model (model_id)"; hw_version gets its own line.
+            "mdl": "Settings apply within 60 s",
+            "hw": "github.com/hoxxep/UNAS-Pro-fan-control",
+            "cu": conf["device_url"],
         },
         "o": {
             "name": "unas-fan-control",
