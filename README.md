@@ -179,72 +179,11 @@ what state they were left in.
 
 ## MQTT / Home Assistant (Optional)
 
-The optional `mqtt_bridge` service publishes temperatures and fan speeds to an
-MQTT broker (e.g. mosquitto) with [Home Assistant MQTT
-discovery](https://www.home-assistant.io/integrations/mqtt/), and lets you tune
-the fan curve's target temperatures from Home Assistant. It is fully opt-in:
-without a `/root/mqtt_bridge.conf` the service stays inactive and nothing
-changes. Fan control never depends on the bridge — if MQTT or the network is
-down, the fan loop keeps running untouched.
-
-Entities created (device-based discovery, requires Home Assistant ≥ 2024.9):
-
-- **Sensors:** max system/HDD/SSD temperature, per-drive temperature (keyed by
-  drive serial number), fan duty %, and fan RPM per tachometer. Sensors go
-  `unavailable` if the device stops reporting for 3 minutes.
-- **Numbers (configuration):** `System target temp` (35–65°C), `HDD target
-  temp` (25–45°C), `SSD target temp` (35–62°C), and `Minimum fan speed`
-  (10–100%). These map to `SYS_TGT`/`HDD_TGT`/`SSD_TGT`/`MIN_FAN` and are
-  written to `/root/fan_control.conf`, which `fan_control.sh` re-reads every
-  minute. The slider ranges are capped below the fixed `*_MAX` ceilings, so the
-  curve can never be inverted from Home Assistant; `*_MAX` values remain
-  file-edit only by design.
-
-Setup:
-
-```bash
-# 1. Create a broker user (on the broker/Home Assistant side), e.g.:
-#    mosquitto_passwd /etc/mosquitto/passwd unas
-
-# 2. On the UNAS, create the config (deploy.sh copies the example over):
-cp /root/mqtt_bridge.conf.example /root/mqtt_bridge.conf
-chmod 600 /root/mqtt_bridge.conf
-vi /root/mqtt_bridge.conf   # set MQTT_HOST/MQTT_USER/MQTT_PASS
-
-# 3. Start the bridge:
-systemctl restart mqtt_bridge.service
-systemctl status mqtt_bridge.service
-```
-
-The device then appears in Home Assistant under **Settings → Devices &
-Services → MQTT** as "UNAS Fan Control".
-
-Implementation notes: the bridge is a single-file, stdlib-only python3 daemon
-(`mqtt_bridge.py`) speaking MQTT 3.1.1 with username/password auth and optional
-TLS. It deliberately avoids `paho-mqtt`/`mosquitto-clients` because UniFi OS
-firmware updates wipe apt-installed packages, while `/root` and `python3`
-survive. `fan_control.sh` itself stays MQTT-free: it just writes a JSON
-snapshot to `/run/fan_control/state.json` (via `fan_control_state.sh`) that the
-bridge reads.
-
-<details>
-<summary><strong>Uninstall the MQTT bridge</strong></summary>
-
-```bash
-# Remove the device from Home Assistant (clears retained discovery config).
-/root/mqtt_bridge.py --clear
-
-systemctl disable --now mqtt_bridge.service
-rm -f /root/mqtt_bridge.py /root/mqtt_bridge.conf /root/mqtt_bridge.conf.example \
-      /root/fan_control_state.sh /root/fan_control.conf \
-      /etc/systemd/system/mqtt_bridge.service
-systemctl daemon-reload
-```
-
-Removing `/root/fan_control.conf` returns `fan_control.sh` to the defaults
-hardcoded at the top of the script.
-
-</details>
+An optional `mqtt_bridge` service publishes temperatures and fan speeds to an
+MQTT broker (e.g. mosquitto) with Home Assistant discovery, and lets you tune
+the fan curve's target temperatures from Home Assistant. It is fully opt-in
+(inactive without `/root/mqtt_bridge.conf`), and fan control never depends on
+it. See [MQTT.md](MQTT.md) for setup, entities, and uninstall.
 
 ## Algorithm Parameters
 

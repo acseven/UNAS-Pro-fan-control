@@ -25,7 +25,9 @@ Repo: https://github.com/hoxxep/UNAS-Pro-fan-control
 License: MIT
 """
 
+import hashlib
 import json
+import math
 import os
 import re
 import select
@@ -43,6 +45,7 @@ FAN_CONF = os.environ.get("FAN_CONF", "/root/fan_control.conf")
 STATE_FILE = os.environ.get("FAN_STATE_FILE", "/run/fan_control/state.json")
 KEEPALIVE = 60
 STATE_EXPIRE_AFTER = 180  # seconds; ~3x the 60s fan_control loop
+MAX_PACKET = 1 << 20  # sanity cap on inbound packets; guards memory spikes
 
 # Curve parameters exposed as Home Assistant number entities. Ranges are hard
 # caps chosen to sit below the fixed *_MAX ceilings in fan_control.sh, so a
@@ -116,6 +119,8 @@ DISCONNECT = bytes([0xE0, 0x00])
 
 def parse_publish(flags, body):
     """Parse an incoming PUBLISH body -> (topic, payload)."""
+    if len(body) < 2:
+        raise ConnectionError("malformed PUBLISH")
     tlen = struct.unpack(">H", body[:2])[0]
     topic = body[2:2 + tlen].decode("utf-8", "replace")
     pos = 2 + tlen
@@ -168,19 +173,32 @@ class MqttClient:
 
     def loop(self, timeout):
         """Process incoming packets for up to `timeout` seconds; keepalive."""
-        readable, _, _ = select.select([self.sock], [], [], timeout)
-        if readable:
-            ptype, flags, body = self._read_packet()
-            self._dispatch(ptype, flags, body)
-        if time.time() - self.last_send > KEEPALIVE / 2:
+        # select() cannot see data already decrypted into the SSL layer's
+        # buffer, so check pending() first and drain after each read.
+        if self._pending() or select.select([self.sock], [], [], timeout)[0]:
+            self._dispatch(*self._read_packet())
+            while self._pending():
+                self._dispatch(*self._read_packet())
+        if time.monotonic() - self.last_send > KEEPALIVE / 2:
             self._send(PINGREQ)
+
+    def _pending(self):
+        return isinstance(self.sock, ssl.SSLSocket) and self.sock.pending() > 0
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
 
     def disconnect(self):
         try:
             self._send(DISCONNECT)
-            self.sock.close()
         except OSError:
             pass
+        self.close()
 
     def _dispatch(self, ptype, flags, body):
         if ptype == 0x30 and self.on_message:
@@ -190,7 +208,7 @@ class MqttClient:
 
     def _send(self, data):
         self.sock.sendall(data)
-        self.last_send = time.time()
+        self.last_send = time.monotonic()
 
     def _recv_exact(self, n):
         buf = b""
@@ -212,6 +230,8 @@ class MqttClient:
             mult *= 128
         else:
             raise ConnectionError("bad varint")
+        if remaining > MAX_PACKET:
+            raise ConnectionError("packet too large (%d bytes)" % remaining)
         body = self._recv_exact(remaining) if remaining else b""
         return first & 0xF0, first & 0x0F, body
 
@@ -221,7 +241,10 @@ class MqttClient:
 # ---------------------------------------------------------------------------
 
 def parse_conf_file(path):
-    """Parse a bash-style KEY=value file (comments, optional quotes)."""
+    """Parse a KEY=value file (full-line and inline comments, optional quotes).
+
+    Values containing a literal '#' must be quoted.
+    """
     conf = {}
     with open(path) as f:
         for line in f:
@@ -232,6 +255,8 @@ def parse_conf_file(path):
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                 value = value[1:-1]
+            else:
+                value = value.split("#", 1)[0].strip()
             conf[key.strip()] = value
     return conf
 
@@ -244,17 +269,31 @@ def load_bridge_conf(path):
     raw = parse_conf_file(path)
     if "MQTT_HOST" not in raw:
         sys.exit("MQTT_HOST missing from %s" % path)
+    try:
+        port = int(raw.get("MQTT_PORT", "1883"))
+    except ValueError:
+        sys.exit("MQTT_PORT in %s is not a number: %r" % (path, raw.get("MQTT_PORT")))
+    if raw.get("MQTT_PASS") and not raw.get("MQTT_USER"):
+        sys.exit("MQTT_PASS is set but MQTT_USER is missing in %s -- MQTT "
+                 "cannot send a password without a username." % path)
     device_id = sanitize_id(raw.get("MQTT_DEVICE_ID") or socket.gethostname().split(".")[0].lower())
+    prefix = raw.get("MQTT_DISCOVERY_PREFIX", "homeassistant")
+    if not 0 < len(device_id) <= 64 or not 0 < len(prefix) <= 64:
+        sys.exit("MQTT_DEVICE_ID / MQTT_DISCOVERY_PREFIX must be 1-64 characters.")
     return {
         "host": raw["MQTT_HOST"],
-        "port": int(raw.get("MQTT_PORT", "1883")),
+        "port": port,
         "user": raw.get("MQTT_USER") or None,
         "password": raw.get("MQTT_PASS"),
         "tls": raw.get("MQTT_TLS", "").lower() in ("1", "true", "yes"),
         "tls_ca": raw.get("MQTT_TLS_CA", ""),
         "device_id": device_id,
-        "client_id": ("unasfc-" + device_id)[:23],
-        "discovery_prefix": raw.get("MQTT_DISCOVERY_PREFIX", "homeassistant"),
+        # 23 bytes (broker-safe): 7-char prefix + 8-char hash of the full
+        # device_id (so long ids that share a prefix cannot collide) + 7 chars
+        # of the id for readability.
+        "client_id": "unasfc-" + hashlib.sha1(device_id.encode()).hexdigest()[:8]
+                     + "-" + device_id[:7],
+        "discovery_prefix": prefix,
     }
 
 
@@ -276,11 +315,10 @@ def clamp(value, lo, hi):
 
 
 def pct_to_raw(pct):
-    return round(pct * 255 / 100)
-
-
-def raw_to_pct(raw):
-    return round(raw * 100 / 255)
+    # ceil, not round: makes the HA display template (round(raw*100/255))
+    # a stable round-trip (39 -> 15% -> 39, not 38), and errs toward more
+    # cooling, never less.
+    return math.ceil(pct * 255 / 100)
 
 
 # ---------------------------------------------------------------------------
@@ -318,21 +356,26 @@ def discovery_payload(conf, state):
     cmps = {
         "sys_temp": sensor("sys_temp", "System temperature",
                            "{{ value_json.sys_temp }}", "°C", "temperature"),
-        "hdd_temp": sensor("hdd_temp", "HDD temperature (max)",
-                           "{{ value_json.hdd_temp }}", "°C", "temperature"),
-        "ssd_temp": sensor("ssd_temp", "SSD temperature (max)",
-                           "{{ value_json.ssd_temp }}", "°C", "temperature"),
         "fan_duty": sensor("fan_duty", "Fan duty",
                            "{{ value_json.fan_duty_pct }}", "%"),
     }
+    # hdd_temp/ssd_temp are null in the snapshot when no drive of that class
+    # exists; omit the sensor rather than report a misleading 0°C.
+    for key, name in (("hdd_temp", "HDD temperature (max)"),
+                      ("ssd_temp", "SSD temperature (max)")):
+        if state.get(key) is not None:
+            cmps[key] = sensor(key, name,
+                               "{{ value_json.%s }}" % key, "°C", "temperature")
+    # Drive/tach keys are pre-sanitized to [A-Za-z0-9_-] by
+    # fan_control_state.sh, so they are safe inside the Jinja templates.
     for serial in sorted(state.get("drives", {})):
         d = state["drives"][serial]
-        key = "drive_" + sanitize_id(serial)
+        key = "drive_" + serial
         name = "%s %s temperature" % (d.get("class", "Drive"), os.path.basename(d.get("dev", serial)))
         cmps[key] = sensor(key, name,
                            "{{ value_json.drives['%s'].temp }}" % serial, "°C", "temperature")
     for tach in sorted(state.get("tachs", {})):
-        key = "tach_" + sanitize_id(tach)
+        key = "tach_" + tach
         cmps[key] = sensor(key, "Fan %s" % tach,
                            "{{ value_json.tachs['%s'] }}" % tach, "rpm")
 
@@ -374,7 +417,9 @@ def discovery_payload(conf, state):
 
 def discovery_signature(state):
     """Set of dynamic components; discovery is republished when it changes."""
-    return (tuple(sorted(state.get("drives", {}))), tuple(sorted(state.get("tachs", {}))))
+    return (tuple(sorted(state.get("drives", {}))),
+            tuple(sorted(state.get("tachs", {}))),
+            tuple(k for k in ("hdd_temp", "ssd_temp") if state.get(k) is not None))
 
 
 # ---------------------------------------------------------------------------
@@ -389,17 +434,20 @@ class Bridge:
         self.state_mtime = 0.0
         self.signature = None
         self.client = None
+        self.online = False
+        self.backoff = 5
 
     def run(self):
-        backoff = 5
         while True:
             try:
                 self.connect_and_loop()
-                backoff = 5
-            except (OSError, ConnectionError) as e:
-                log("MQTT connection lost: %s -- reconnecting in %ds" % (e, backoff))
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+            except (OSError, ConnectionError, struct.error) as e:
+                log("MQTT connection lost: %s -- reconnecting in %ds" % (e, self.backoff))
+            finally:
+                if self.client:
+                    self.client.close()
+            time.sleep(self.backoff)
+            self.backoff = min(self.backoff * 2, 60)
 
     def connect_and_loop(self):
         self.client = MqttClient(self.conf)
@@ -407,18 +455,37 @@ class Bridge:
         self.client.connect(self.topics["availability"], "offline")
         log("Connected to %s:%d as %s" % (self.conf["host"], self.conf["port"], self.conf["client_id"]))
         self.client.subscribe(["homeassistant/status", self.topics["command"] + "+"])
-        self.client.publish(self.topics["availability"], "online", retain=True)
-        self.signature = None  # force discovery republish on (re)connect
+        self.backoff = 5
+        self.set_online(True)
+        # Republish immediately with the cached snapshot (if any) -- do not
+        # wait for the state file to change, the broker may have lost the
+        # retained discovery config while we were away.
+        self.signature = None
+        if self.state is not None:
+            self.publish_discovery_if_changed()
+            self.publish_state()
         while True:
             self.check_state_file()
             self.client.loop(2.0)
+
+    def set_online(self, online):
+        """Availability tracks both the MQTT link and snapshot freshness."""
+        if online != self.online:
+            self.client.publish(self.topics["availability"],
+                                "online" if online else "offline", retain=True)
+            self.online = online
+            if not online:
+                log("State snapshot stale/missing -- marked unavailable")
 
     def check_state_file(self):
         try:
             mtime = os.stat(STATE_FILE).st_mtime
         except OSError:
-            return  # fan_control.sh hasn't written a snapshot yet
+            self.set_online(False)  # fan_control.sh isn't writing snapshots
+            return
         if mtime == self.state_mtime:
+            if time.time() - mtime > STATE_EXPIRE_AFTER:
+                self.set_online(False)  # fan_control.sh stopped updating
             return
         try:
             with open(STATE_FILE) as f:
@@ -428,6 +495,7 @@ class Bridge:
             return
         self.state_mtime = mtime
         self.state = state
+        self.set_online(True)
         self.publish_discovery_if_changed()
         self.publish_state()
 
@@ -452,7 +520,8 @@ class Bridge:
                 log("Home Assistant birth message -- republishing")
                 self.signature = None
                 self.publish_discovery_if_changed()
-                self.client.publish(self.topics["availability"], "online", retain=True)
+                self.client.publish(self.topics["availability"],
+                                    "online" if self.online else "offline", retain=True)
                 self.publish_state()
         elif topic.startswith(self.topics["command"]):
             self.handle_command(topic[len(self.topics["command"]):], payload)
@@ -463,24 +532,37 @@ class Bridge:
             log("Unknown parameter command: %s" % pkey)
             return
         try:
-            value = clamp(round(float(payload)), spec["min"], spec["max"])
+            value = float(payload)
         except ValueError:
             log("Ignoring non-numeric %s command: %r" % (pkey, payload))
             return
-        params = dict((self.state or {}).get("params", {}))
-        params[pkey if pkey != "min_fan_pct" else "min_fan"] = \
-            value if pkey != "min_fan_pct" else pct_to_raw(value)
-        conf_raw = {}
-        for key, sp in PARAMS.items():
-            skey = "min_fan" if key == "min_fan_pct" else key
-            if skey in params:
-                conf_raw[sp["conf_key"]] = params[skey]
-        write_fan_conf(conf_raw)
+        if not math.isfinite(value):
+            log("Ignoring non-finite %s command: %r" % (pkey, payload))
+            return
+        value = clamp(round(value), spec["min"], spec["max"])
+        conf_value = pct_to_raw(value) if pkey == "min_fan_pct" else value
+        state_key = "min_fan" if pkey == "min_fan_pct" else pkey
+        # The conf file is the source of truth for persisted overrides: merge
+        # into whatever is already there (including hand-added keys), never
+        # rebuild from possibly-empty in-memory state.
+        try:
+            current = parse_conf_file(FAN_CONF) if os.path.exists(FAN_CONF) else {}
+        except OSError:
+            current = {}
+        merged = {k: int(v) for k, v in current.items() if v.isdigit()}
+        if merged.get(spec["conf_key"]) == conf_value:
+            return  # unchanged (e.g. slider drag noise) -- skip the write
+        merged[spec["conf_key"]] = conf_value
+        try:
+            write_fan_conf(merged)
+        except OSError as e:
+            log("Failed to write %s: %s" % (FAN_CONF, e))
+            return
         log("Set %s=%s (conf updated; fan_control picks it up within 60s)" % (pkey, value))
         # Optimistically patch the cached state so the HA slider doesn't snap
         # back while waiting for the next fan_control loop iteration.
         if self.state is not None:
-            self.state.setdefault("params", {}).update(params)
+            self.state.setdefault("params", {})[state_key] = conf_value
             self.publish_state()
 
 
@@ -489,8 +571,14 @@ class Bridge:
 # ---------------------------------------------------------------------------
 
 def clear(conf):
-    """Remove the device from Home Assistant and exit."""
-    client = MqttClient(conf)
+    """Remove the device from Home Assistant and exit.
+
+    Stop mqtt_bridge.service first: a running bridge would republish the
+    discovery config on its next reconnect, undoing the clear.
+    """
+    # Distinct client_id so this one-shot connection cannot take over (and
+    # kill) the daemon's broker session.
+    client = MqttClient(dict(conf, client_id=("c" + conf["client_id"])[:23]))
     client.connect(None, None)
     t = topics(conf)
     client.publish(t["discovery"], b"", retain=True)  # empty retained = remove
@@ -517,25 +605,37 @@ def selftest():
     assert pkt[0] == 0x31
     topic, payload = parse_publish(0x01, pkt[2:])
     assert (topic, payload) == ("a/b", b"hi")
+    # malformed PUBLISH raises ConnectionError, not struct.error
+    try:
+        parse_publish(0x00, b"\x00")
+        raise AssertionError("short PUBLISH must raise")
+    except ConnectionError:
+        pass
     # SUBSCRIBE
     pkt = subscribe_packet(1, ["x/+"])
     assert pkt[0] == 0x82 and pkt.endswith(b"\x00\x03x/+\x00")
-    # conf parsing
+    # conf parsing (inline comments stripped unless value is quoted)
     import tempfile
     with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
-        f.write('# comment\nMQTT_HOST="broker.local"\nMQTT_PORT=1884\nMQTT_USER=u\n')
+        f.write('# comment\nMQTT_HOST="broker.local"\nMQTT_PORT=1884  # default\n'
+                'MQTT_USER=u\nMQTT_PASS="se#ret"\n')
         path = f.name
-    os.environ["MQTT_BRIDGE_CONF"] = path
     raw = parse_conf_file(path)
-    assert raw == {"MQTT_HOST": "broker.local", "MQTT_PORT": "1884", "MQTT_USER": "u"}
+    assert raw == {"MQTT_HOST": "broker.local", "MQTT_PORT": "1884",
+                   "MQTT_USER": "u", "MQTT_PASS": "se#ret"}
     os.unlink(path)
-    # clamping and MIN_FAN conversion
+    # clamping and MIN_FAN conversion; ceil keeps the HA display template
+    # ({{ (raw * 100 / 255) | round(0) }}) a stable round-trip.
     assert clamp(200, 25, 45) == 45 and clamp(-5, 25, 45) == 25
-    assert pct_to_raw(15) == 38 and raw_to_pct(39) == 15
+    assert pct_to_raw(100) == 255 and pct_to_raw(10) == 26
+    for pct in range(10, 101):
+        # resubmitting the displayed percentage must not change the raw value
+        assert round(pct_to_raw(pct) * 100 / 255) == pct, pct
+    assert pct_to_raw(round(39 * 100 / 255)) == 39  # the default MIN_FAN
     assert sanitize_id("WD-WX/1 2") == "WD-WX_1_2"
     # discovery payload sanity
     conf = {"device_id": "unas", "discovery_prefix": "homeassistant"}
-    state = {"sys_temp": 50, "hdd_temp": 34, "ssd_temp": 52, "fan_duty_pct": 25,
+    state = {"sys_temp": 50, "hdd_temp": 34, "ssd_temp": None, "fan_duty_pct": 25,
              "drives": {"WD1": {"class": "HDD", "dev": "/dev/sda", "temp": 34}},
              "tachs": {"adt7475_fan1": 3170},
              "params": {"sys_tgt": 50, "hdd_tgt": 32, "ssd_tgt": 50, "min_fan": 39}}
@@ -544,9 +644,10 @@ def selftest():
     assert d["cmps"]["drive_WD1"]["value_template"] == "{{ value_json.drives['WD1'].temp }}"
     assert d["cmps"]["hdd_tgt"]["p"] == "number" and d["cmps"]["hdd_tgt"]["max"] == 45
     assert d["cmps"]["tach_adt7475_fan1"]["unit_of_measurement"] == "rpm"
+    assert "hdd_temp" in d["cmps"] and "ssd_temp" not in d["cmps"]  # null class omitted
     assert all("unique_id" in c for c in d["cmps"].values())
     json.dumps(d)  # must serialize
-    assert discovery_signature(state) == (("WD1",), ("adt7475_fan1",))
+    assert discovery_signature(state) == (("WD1",), ("adt7475_fan1",), ("hdd_temp",))
     print("selftest OK")
 
 
@@ -564,11 +665,9 @@ def main():
     bridge = Bridge(conf)
 
     def on_term(signum, frame):
-        try:
-            bridge.client.publish(bridge.topics["availability"], "offline", retain=True)
-            bridge.client.disconnect()
-        except (OSError, ConnectionError, AttributeError):
-            pass
+        # Just exit: closing the socket without DISCONNECT makes the broker
+        # fire our retained LWT ("offline"), which is exactly the state we
+        # want -- and keeps the handler safe to run mid-sendall.
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, on_term)

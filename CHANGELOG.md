@@ -17,15 +17,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fan-curve tuning from Home Assistant: `SYS_TGT`, `HDD_TGT`, `SSD_TGT`, and
   `MIN_FAN` exposed as number entities. Values are clamped to ranges that stay
   below the fixed `*_MAX` ceilings and persisted to `/root/fan_control.conf`.
-- `fan_control_state.sh`: optional helper sourced by `fan_control.sh` that
-  writes an atomic JSON snapshot of all readings to
-  `/run/fan_control/state.json` each loop, for the bridge (or anything else)
-  to consume.
+- `fan_control_state.sh`: optional helper sourced by `fan_control.sh`
+  providing the conf-override and state-snapshot hooks. Snapshots (an atomic
+  JSON file at `/run/fan_control/state.json`, root-only, including drive
+  serial numbers) are only written once `/root/mqtt_bridge.conf` exists, so
+  non-MQTT installs do no extra work. Overrides are parsed against a strict
+  key/integer allowlist — the conf file is never `source`d, so a corrupt file
+  can neither crash fan control nor execute code.
 
 ### Changed
-- `fan_control.sh`: sources `/root/fan_control.conf` overrides (if present)
-  each iteration, reports each drive's serial number, and calls the optional
-  state-snapshot hooks (no-ops when the helper is not installed).
+- `fan_control.sh`: defines no-op hook stubs and calls them each iteration;
+  installing `fan_control_state.sh` replaces the stubs. Drive serial numbers
+  are passed to the state snapshot (console output is unchanged). A missing
+  or broken helper file leaves the stubs in place — fan control never depends
+  on the MQTT feature.
 - `deploy.sh`: also deploys the bridge files and unit (inert without a conf).
 
 ## 2026-06-25: Overhaul to support all UNAS devices correctly.

@@ -11,6 +11,7 @@ MQTT_PORT=1883
 
 # Broker credentials. Create a dedicated user on the broker, e.g.:
 #   mosquitto_passwd /etc/mosquitto/passwd unas
+# Quote the value if it contains a '#' character.
 MQTT_USER=unas
 MQTT_PASS=secret
 
@@ -21,7 +22,8 @@ MQTT_PASS=secret
 
 # Optional overrides. Device ID defaults to the hostname; it becomes part of
 # the MQTT topics and the Home Assistant device identity, so pick something
-# stable. Discovery prefix must match the Home Assistant MQTT integration
-# setting (default: homeassistant).
+# stable — and UNIQUE per device if several UNAS units share one broker.
+# Discovery prefix must match the Home Assistant MQTT integration setting
+# (default: homeassistant).
 #MQTT_DEVICE_ID=unas-pro
 #MQTT_DISCOVERY_PREFIX=homeassistant

@@ -20,6 +20,13 @@ ExecStart=/usr/bin/python3 /root/mqtt_bridge.py
 Restart=always
 RestartSec=10
 User=root
+# Keep the bridge strictly lightweight: hard memory cap (a leak gets the
+# process killed and cleanly restarted, never the NAS starved), a CPU quota,
+# and low scheduling priority so fan control and storage always win.
+MemoryMax=48M
+CPUQuota=25%
+Nice=10
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target

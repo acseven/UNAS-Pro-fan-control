@@ -35,20 +35,17 @@ SSD_TGT=50
 SSD_MAX=70
 MIN_FAN=39  # 15% of 255 (increase baseline to reduce fan speed variation)
 
-# Optional overrides for the parameters above, written by the MQTT bridge when
-# tuning from Home Assistant (see mqtt_bridge.py). Sourced on every loop
-# iteration so changes apply within a minute. Delete the file to return to the
-# defaults above.
-FAN_CONF=/root/fan_control.conf
-
-# Optional state-snapshot helper (fan_control_state.sh) used by the MQTT
-# bridge; without it these hooks are no-ops and nothing changes.
+# Optional MQTT-bridge hooks (fan_control_state.sh): apply_fan_conf applies
+# validated fan-curve overrides tuned from Home Assistant, and the state_*
+# hooks snapshot readings for the bridge. The no-op stubs below are the
+# defaults; a missing or broken helper leaves them in place, so fan control
+# never depends on the helper or the MQTT bridge.
+apply_fan_conf() { :; }
+state_begin() { :; }
+state_add_drive() { :; }
+state_end() { :; }
 if [[ -f /root/fan_control_state.sh ]]; then
-    source /root/fan_control_state.sh
-else
-    state_begin() { :; }
-    state_add_drive() { :; }
-    state_end() { :; }
+    source /root/fan_control_state.sh 2>/dev/null || true
 fi
 
 usage() {
@@ -219,7 +216,7 @@ get_system_temps() {
 set_fan_speed() {
     # Apply Home Assistant/MQTT parameter overrides, and reset the state
     # snapshot for this iteration (no-ops unless the MQTT bridge is set up).
-    [[ -f "$FAN_CONF" ]] && source "$FAN_CONF"
+    apply_fan_conf
     state_begin
 
     # Auto-discover all system temperature sensors (CPU die + board/airflow) and
