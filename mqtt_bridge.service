@@ -28,15 +28,18 @@ CPUQuota=25%
 Nice=10
 # Sandbox: this is the only network-facing process in the repo, parsing a
 # binary protocol from the broker, so confine it. It only needs to read
-# /root/mqtt_bridge.conf + /run/fan_control/state.json, write
-# /root/fan_control.conf, and open one outbound TCP connection.
+# /root/mqtt_bridge.py + /root/mqtt_bridge.conf + /run/fan_control/state.json,
+# write /root/fan_control.conf, and open one outbound TCP connection.
+# NOTE: the code lives in /root, so ProtectHome=yes (masks /root) and
+# ProtectSystem=strict (needs ReadWritePaths=/root to punch back in) both
+# break here -- UniFi OS's systemd v247 does not honour ReadWritePaths=/root
+# over those masks, so the process gets EACCES reading its own script.
+# ProtectSystem=full leaves /root writable without any override, so use it.
 # If the bridge fails to start/connect after a UniFi OS update, bisect by
 # commenting these out (fan control itself is unaffected either way).
 NoNewPrivileges=yes
 UMask=0077
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/root
+ProtectSystem=full
 PrivateTmp=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 CapabilityBoundingSet=
